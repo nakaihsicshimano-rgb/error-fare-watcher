@@ -1,20 +1,22 @@
-import os
 import json
+import os
 import re
+import time
+import html
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
+
 import requests
 from bs4 import BeautifulSoup
-from pathlib import Path
-from urllib.parse import urljoin
-from linebot.v3.messaging import (
-    Configuration,
-    ApiClient,
-    MessagingApi,
-    PushMessageRequest,
-    TextMessage,
-)
 
-LINE_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_USER_ID = os.environ["LINE_USER_ID"]
+
+# =========================
+# 基本設定
+# =========================
+
+JST = timezone(timedelta(hours=9))
 
 MONITOR_URLS = [
     "https://www.secretflying.com/",
@@ -23,15 +25,24 @@ MONITOR_URLS = [
     "https://www.secretflying.com/east-asia-flight-deals/",
 ]
 
-SEEN = Path("seen_urls.json")
+SEEN_URLS_FILE = "seen_urls.json"
 
-REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 SecretFlyingMonitor/1.0"
-}
+HTTP_TIMEOUT_SECONDS = 20
+MAX_RETRY_COUNT = 2
+RETRY_WAIT_SECONDS = 3
+
+MAX_ARTICLE_AGE_DAYS = 14
+
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
+
+USER_AGENT = "Mozilla/5.0 SecretFlyingMonitor/1.1"
+
 
 # =========================
-# 日本発判定キーワード
+# 判定キーワード
 # =========================
+
 JAPAN_ORIGIN_KEYWORDS = [
     "japan",
     "tokyo",
@@ -44,557 +55,706 @@ JAPAN_ORIGIN_KEYWORDS = [
     "hnd",
     "nagoya",
     "ngo",
-    "chubu",
     "fukuoka",
     "fuk",
     "sapporo",
     "cts",
     "okinawa",
-    "naha",
     "oka",
 ]
 
-# =========================
-# ヨーロッパ方面判定キーワード
-# 仲井さん向けに、ミュンヘン・フランクフルト・イスタンブールを厚めに設定
-# =========================
-EUROPE_DEST_KEYWORDS = [
+S_RANK_DESTINATION_KEYWORDS = [
+    # Europe
     "europe",
-
-    # Germany
-    "germany",
-    "munich",
-    "muc",
-    "frankfurt",
-    "fra",
-    "berlin",
-    "ber",
-    "dusseldorf",
-    "düsseldorf",
-    "dus",
-    "hamburg",
-    "ham",
-
-    # Turkey / Istanbul
-    "turkey",
-    "turkiye",
-    "türkiye",
-    "istanbul",
-    "ist",
-    "sabiha",
-    "saw",
-
-    # France
-    "france",
-    "paris",
-    "cdg",
-    "ory",
-    "nice",
-    "nce",
-
-    # UK / Ireland
     "uk",
     "united kingdom",
-    "england",
     "london",
-    "lhr",
-    "lgw",
-    "manchester",
-    "man",
-    "edinburgh",
-    "edi",
-    "ireland",
-    "dublin",
-    "dub",
-
-    # Italy
+    "england",
+    "france",
+    "paris",
+    "germany",
+    "frankfurt",
+    "munich",
     "italy",
     "rome",
-    "fco",
     "milan",
-    "mxp",
-    "venice",
-    "vce",
-
-    # Spain / Portugal
     "spain",
     "madrid",
-    "mad",
     "barcelona",
-    "bcn",
-    "portugal",
-    "lisbon",
-    "lis",
-    "porto",
-    "opo",
-
-    # Netherlands / Belgium / Switzerland / Austria
     "netherlands",
     "amsterdam",
-    "ams",
-    "belgium",
-    "brussels",
-    "bru",
     "switzerland",
     "zurich",
-    "zrh",
-    "geneva",
-    "gva",
     "austria",
     "vienna",
-    "vie",
-
-    # Northern / Eastern Europe
-    "denmark",
-    "copenhagen",
-    "cph",
-    "sweden",
-    "stockholm",
-    "arn",
-    "norway",
-    "oslo",
-    "osl",
-    "finland",
-    "helsinki",
-    "hel",
+    "turkey",
+    "istanbul",
     "poland",
     "warsaw",
-    "waw",
-    "gdansk",
-    "gdn",
-    "czech",
-    "prague",
-    "prg",
-    "hungary",
-    "budapest",
-    "bud",
+    "ireland",
+    "dublin",
+    "portugal",
+    "lisbon",
+    "denmark",
+    "copenhagen",
+    "finland",
+    "helsinki",
+    "norway",
+    "oslo",
+    "sweden",
+    "stockholm",
     "greece",
     "athens",
-    "ath",
+    "belgium",
+    "brussels",
+    "czech",
+    "prague",
+    "hungary",
+    "budapest",
+
+    # North America
+    "usa",
+    "united states",
+    "america",
+    "new york",
+    "los angeles",
+    "san francisco",
+    "seattle",
+    "chicago",
+    "boston",
+    "washington",
+    "canada",
+    "vancouver",
+    "toronto",
+    "montreal",
+
+    # Middle East
+    "dubai",
+    "abu dhabi",
+    "uae",
+    "doha",
+    "qatar",
+    "middle east",
 ]
 
-# 通知文に補足表示するためのキーワード
-PREMIUM_KEYWORDS = [
-    "business class",
-    "premium economy",
-    "first class",
-    "lie-flat",
-    "lie flat",
+A_RANK_DESTINATION_KEYWORDS = [
+    "singapore",
+    "bangkok",
+    "thailand",
+    "kuala lumpur",
+    "malaysia",
+    "taipei",
+    "taiwan",
+    "hong kong",
+    "seoul",
+    "korea",
+    "manila",
+    "philippines",
+    "jakarta",
+    "indonesia",
+    "bali",
+    "vietnam",
+    "ho chi minh",
+    "hanoi",
+    "delhi",
+    "india",
+    "asia",
+    "east asia",
+    "southeast asia",
 ]
 
-ERROR_FARE_KEYWORDS = [
-    "error fare",
-    "mistake fare",
-    "glitch",
-    "ota glitch",
-    "fuel dump",
-    "self-dump",
-    "self dump",
+EXCLUDE_TITLE_KEYWORDS = [
+    "announcement",
+    "membership",
+    "premium",
+    "deal locked",
+    "guide",
+    "things to do",
+    "best things",
+    "hotel",
+    "hotels",
+    "credit card",
+    "travel guide",
+    "complete guide",
 ]
 
 
-def normalize(text):
-    """
-    改行や余分な空白を1つのスペースに整える。
-    """
-    return re.sub(r"\s+", " ", text or "").strip()
+# =========================
+# データ構造
+# =========================
 
+@dataclass
+class Article:
+    title: str
+    url: str
+    source_url: str
+    text: str
+    date: Optional[datetime] = None
 
-def load_seen():
-    """
-    通知済みURLを読み込む。
-    ファイルが無い場合、空集合として扱う。
-    """
-    if not SEEN.exists():
-        print("seen_urls.json が見つかりません。新規扱いにします。")
-        return set()
 
-    try:
-        text = SEEN.read_text(encoding="utf-8").strip()
+@dataclass
+class Candidate:
+    article: Article
+    origin: str
+    destination: str
+    price_text: Optional[str]
+    rank: str
+    rank_reason: str
 
-        if not text:
-            print("seen_urls.json が空です。新規扱いにします。")
-            return set()
 
-        data = json.loads(text)
+# =========================
+# 共通関数
+# =========================
 
-        if isinstance(data, list):
-            return set(str(url) for url in data)
+def normalize_text(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    text = html.unescape(text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip().lower()
 
-        print("seen_urls.json の形式が不正です。新規扱いにします。")
-        return set()
 
-    except Exception as e:
-        print("seen_urls.json の読み込みに失敗しました:", e)
-        return set()
+def contains_any(text: str, keywords: List[str]) -> bool:
+    text = normalize_text(text)
+    return any(keyword in text for keyword in keywords)
 
 
-def save_seen(seen):
-    """
-    通知済みURLを保存する。
-    """
-    SEEN.write_text(
-        json.dumps(sorted(seen), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+def now_jst() -> datetime:
+    return datetime.now(JST)
 
 
-def notify(text):
-    """
-    LINEへPush通知する。
-    """
-    conf = Configuration(access_token=LINE_TOKEN)
+# =========================
+# 履歴管理
+# =========================
 
-    with ApiClient(conf) as api:
-        MessagingApi(api).push_message(
-            PushMessageRequest(
-                to=LINE_USER_ID,
-                messages=[
-                    TextMessage(text=text)
-                ],
-            )
-        )
-
-
-def contains_any(text, keywords):
-    """
-    指定キーワードのいずれかが含まれるか判定する。
-    """
-    text = text.lower()
-
-    return any(keyword.lower() in text for keyword in keywords)
-
-
-def first_keyword_position(text, keywords):
-    """
-    指定キーワード群のうち、最初に出現する位置を返す。
-    見つからない場合は None。
-    """
-    text = text.lower()
-    positions = []
-
-    for keyword in keywords:
-        pos = text.find(keyword.lower())
-        if pos >= 0:
-            positions.append(pos)
-
-    if not positions:
-        return None
-
-    return min(positions)
-
-
-def cleanup_route_text(text):
-    """
-    ルート抽出時に余分な前置き表現を取り除く。
-    """
-    text = normalize(text.lower())
-
-    prefixes = [
-        "error fare",
-        "cheap flights",
-        "non-stop flights",
-        "nonstop flights",
-        "non-stop",
-        "nonstop",
-        "business class",
-        "premium economy",
-        "first class",
-        "summer",
-        "xmas",
-        "new year",
-        "roundtrip",
-        "one-way",
-    ]
-
-    for prefix in prefixes:
-        text = text.replace(prefix, " ")
-
-    text = normalize(text)
-    text = text.strip(" :-–—|")
-
-    return text
-
-
-def cut_destination_text(text):
-    """
-    destination側に価格や航空会社情報が続く場合、ルート部分だけに近づける。
-    """
-    cut_markers = [
-        " for only ",
-        " from only ",
-        " with ",
-        " roundtrip",
-        " one-way",
-        " return",
-        " in ",
-        " during ",
-        " available",
-    ]
-
-    lowered = text.lower()
-    cut_positions = []
-
-    for marker in cut_markers:
-        pos = lowered.find(marker)
-        if pos >= 0:
-            cut_positions.append(pos)
-
-    if cut_positions:
-        text = text[:min(cut_positions)]
-
-    return normalize(text)
-
-
-def parse_route_segments(title):
-    """
-    Secret Flyingの記事タイトルから origin / destination をざっくり抽出する。
-
-    対応イメージ：
-    - Tokyo, Japan to Frankfurt, Germany for only ...
-    - Non-stop from Osaka, Japan to Paris, France for only ...
-    - Cheap flights from Tokyo to Istanbul ...
-    """
-    text = normalize(title.lower())
-
-    origin = None
-    destination = None
-
-    # パターン1：from A to B
-    from_to_match = re.search(r"\bfrom\s+(.+?)\s+to\s+(.+)", text)
-
-    if from_to_match:
-        origin = cleanup_route_text(from_to_match.group(1))
-        destination = cut_destination_text(from_to_match.group(2))
-        destination = cleanup_route_text(destination)
-
-        return {
-            "origin": origin,
-            "destination": destination,
-        }
-
-    # パターン2：A to B
-    # 例：Tokyo, Japan to Frankfurt, Germany for only ...
-    if " to " in text:
-        parts = text.split(" to ", 1)
-
-        origin = cleanup_route_text(parts[0])
-        destination = cut_destination_text(parts[1])
-        destination = cleanup_route_text(destination)
-
-        return {
-            "origin": origin,
-            "destination": destination,
-        }
-
-    return {
-        "origin": None,
-        "destination": None,
-    }
-
-
-def is_japan_to_europe(title):
-    """
-    日本発ヨーロッパ行きかどうかを判定する。
-
-    原則：
-    - origin側に日本系キーワードがある
-    - destination側にヨーロッパ系キーワードがある
-
-    ただし、ルート抽出がうまくいかないタイトルに備えて、
-    日本系キーワードがヨーロッパ系キーワードより前に出ている場合も拾う。
-    """
-    title_lower = normalize(title.lower())
-
-    route = parse_route_segments(title_lower)
-    origin = route["origin"]
-    destination = route["destination"]
-
-    print("route parse:", {"origin": origin, "destination": destination})
-
-    # 方向が取れる場合：日本発 → 欧州着のみ通知
-    if origin and destination:
-        origin_is_japan = contains_any(origin, JAPAN_ORIGIN_KEYWORDS)
-        destination_is_europe = contains_any(destination, EUROPE_DEST_KEYWORDS)
-
-        if origin_is_japan and destination_is_europe:
-            return True
-
-        return False
-
-    # 方向が取れない場合：日本系キーワードが欧州系キーワードより先に出ている場合のみ拾う
-    japan_pos = first_keyword_position(title_lower, JAPAN_ORIGIN_KEYWORDS)
-    europe_pos = first_keyword_position(title_lower, EUROPE_DEST_KEYWORDS)
-
-    if japan_pos is not None and europe_pos is not None and japan_pos < europe_pos:
-        return True
-
-    return False
-
-
-def get_match_reason(title):
-    """
-    通知文に表示する判定理由を作る。
-    """
-    title_lower = title.lower()
-
-    reasons = []
-
-    if contains_any(title_lower, ERROR_FARE_KEYWORDS):
-        reasons.append("エラー運賃系キーワードあり")
-
-    if contains_any(title_lower, PREMIUM_KEYWORDS):
-        reasons.append("上位クラス系キーワードあり")
-
-    route = parse_route_segments(title)
-    origin = route["origin"]
-    destination = route["destination"]
-
-    if origin:
-        reasons.append(f"出発地判定：{origin}")
-
-    if destination:
-        reasons.append(f"目的地判定：{destination}")
-
-    if not reasons:
-        reasons.append("日本発ヨーロッパ候補")
-
-    return " / ".join(reasons)
-
-
-def fetch_articles_from_url(page_url):
-    """
-    指定URLから記事候補を取得する。
-    """
-    print("Fetching:", page_url)
-
-    try:
-        res = requests.get(
-            page_url,
-            headers=REQUEST_HEADERS,
-            timeout=20,
-        )
-        print("Status:", res.status_code, page_url)
-        res.raise_for_status()
-
-    except Exception as e:
-        print("ページ取得に失敗しました:", page_url, e)
+def load_seen_urls() -> List[str]:
+    if not os.path.exists(SEEN_URLS_FILE):
         return []
 
-    soup = BeautifulSoup(res.text, "html.parser")
+    try:
+        with open(SEEN_URLS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    articles = []
-    seen_on_page = set()
+        if isinstance(data, list):
+            return [str(x) for x in data]
 
-    for art in soup.select("article"):
-        a = art.find("a", href=True)
+        if isinstance(data, dict) and "seen_urls" in data:
+            return [str(x) for x in data["seen_urls"]]
 
+        print("seen_urls.json の形式が想定外です。空として扱います。")
+        return []
+
+    except Exception as e:
+        print(f"seen_urls.json の読み込みに失敗しました: {e}")
+        return []
+
+
+def save_seen_urls(seen_urls: List[str]) -> None:
+    unique_urls = sorted(set(seen_urls))
+    with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
+        json.dump(unique_urls, f, ensure_ascii=False, indent=2)
+
+
+# =========================
+# HTTP取得
+# =========================
+
+def fetch_url(url: str) -> Optional[str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    for attempt in range(1, MAX_RETRY_COUNT + 2):
+        try:
+            print(f"Fetching: {url}")
+            response = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
+            print(f"Status: {response.status_code} {url}")
+
+            if response.status_code == 200:
+                return response.text
+
+            print(f"HTTP status が200ではありません: {response.status_code}")
+
+        except Exception as e:
+            print(f"取得失敗 attempt={attempt}: {url} / {e}")
+
+        if attempt <= MAX_RETRY_COUNT:
+            time.sleep(RETRY_WAIT_SECONDS)
+
+    return None
+
+
+# =========================
+# 記事抽出
+# =========================
+
+def is_secretflying_article_url(url: str) -> bool:
+    parsed = urlparse(url)
+
+    if "secretflying.com" not in parsed.netloc:
+        return False
+
+    path = parsed.path.strip("/").lower()
+
+    if not path:
+        return False
+
+    excluded_path_parts = [
+        "category",
+        "tag",
+        "page",
+        "wp-content",
+        "privacy",
+        "terms",
+        "contact",
+        "about",
+        "membership",
+        "premium",
+    ]
+
+    if any(part in path for part in excluded_path_parts):
+        return False
+
+    return True
+
+
+def parse_article_date(text: str) -> Optional[datetime]:
+    month_names = (
+        "January|February|March|April|May|June|July|August|September|October|November|December"
+    )
+
+    pattern = rf"\b({month_names})\s+(\d{{1,2}}),\s+(\d{{4}})\b"
+    m = re.search(pattern, text, flags=re.IGNORECASE)
+
+    if not m:
+        return None
+
+    date_text = m.group(0)
+
+    try:
+        dt = datetime.strptime(date_text, "%B %d, %Y")
+        return dt.replace(tzinfo=JST)
+    except Exception:
+        return None
+
+
+def is_recent_article(article_date: Optional[datetime]) -> bool:
+    if article_date is None:
+        # 日付が取れない場合は、初期版では除外しすぎを避けるため通す
+        return True
+
+    threshold = now_jst() - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+    return article_date >= threshold
+
+
+def extract_articles_from_html(source_url: str, html_text: str) -> List[Article]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    articles: List[Article] = []
+    seen = set()
+
+    # h1/h2/h3配下のリンクを優先
+    for heading in soup.find_all(["h1", "h2", "h3"]):
+        a = heading.find("a", href=True)
         if not a:
             continue
 
-        url = urljoin(page_url, a["href"])
+        title = a.get_text(" ", strip=True)
+        href = urljoin(source_url, a["href"])
 
-        if url in seen_on_page:
+        if not title or not is_secretflying_article_url(href):
             continue
 
-        seen_on_page.add(url)
-
-        title_original = normalize(art.get_text(" ", strip=True))
-
-        if not title_original:
+        if href in seen:
             continue
 
-        articles.append(
-            {
-                "title": title_original,
-                "url": url,
-                "source_page": page_url,
-            }
+        parent_text = ""
+        parent = heading.find_parent()
+        if parent:
+            parent_text = parent.get_text(" ", strip=True)
+
+        combined_text = f"{title} {parent_text}".strip()
+        article_date = parse_article_date(combined_text)
+
+        article = Article(
+            title=html.unescape(title).strip(),
+            url=href,
+            source_url=source_url,
+            text=html.unescape(combined_text).strip(),
+            date=article_date,
         )
+
+        articles.append(article)
+        seen.add(href)
+
+    # hタグで拾えない場合に備えて通常リンクも見る
+    for a in soup.find_all("a", href=True):
+        title = a.get_text(" ", strip=True)
+        href = urljoin(source_url, a["href"])
+
+        if not title or len(title) < 15:
+            continue
+
+        if not is_secretflying_article_url(href):
+            continue
+
+        if href in seen:
+            continue
+
+        parent = a.find_parent()
+        parent_text = parent.get_text(" ", strip=True) if parent else title
+        combined_text = f"{title} {parent_text}".strip()
+        article_date = parse_article_date(combined_text)
+
+        article = Article(
+            title=html.unescape(title).strip(),
+            url=href,
+            source_url=source_url,
+            text=html.unescape(combined_text).strip(),
+            date=article_date,
+        )
+
+        articles.append(article)
+        seen.add(href)
 
     return articles
 
 
-def build_message(article):
-    """
-    LINE通知文を作成する。
-    """
-    title = article["title"]
-    url = article["url"]
-    source_page = article["source_page"]
+def collect_articles() -> List[Article]:
+    all_articles: List[Article] = []
+    seen_urls = set()
 
-    reason = get_match_reason(title)
+    for url in MONITOR_URLS:
+        html_text = fetch_url(url)
+        if not html_text:
+            continue
 
-    message = (
-        "🔥 Sランク：即確認\n"
-        "🇯🇵 日本発 → 🇪🇺 ヨーロッパ候補\n"
-        "\n"
-        f"{title}\n"
-        "\n"
-        f"判定理由：{reason}\n"
-        f"監視元：{source_page}\n"
-        "\n"
-        f"{url}"
-    )
-
-    return message
-
-
-def main():
-    print("=== Secret Flying Monitor Start ===")
-
-    seen = load_seen()
-    print("通知済みURL数:", len(seen))
-
-    all_articles = []
-    collected_urls = set()
-
-    for page_url in MONITOR_URLS:
-        articles = fetch_articles_from_url(page_url)
+        articles = extract_articles_from_html(url, html_text)
 
         for article in articles:
-            if article["url"] in collected_urls:
-                continue
+            if article.url not in seen_urls:
+                all_articles.append(article)
+                seen_urls.add(article.url)
 
-            collected_urls.add(article["url"])
-            all_articles.append(article)
+    return all_articles
 
-    print("取得記事数:", len(all_articles))
 
-    matched_count = 0
-    notified_count = 0
+# =========================
+# 航空券記事判定
+# =========================
 
-    for article in all_articles:
-        title = article["title"]
-        url = article["url"]
+def is_probable_flight_article(article: Article) -> Tuple[bool, str]:
+    text = normalize_text(f"{article.title} {article.text}")
 
-        if url in seen:
-            print("重複のため除外:", url)
+    if contains_any(text, EXCLUDE_TITLE_KEYWORDS):
+        return False, "航空券記事ではない可能性が高い除外キーワードに一致"
+
+    required_keywords = [
+        " to ",
+        " from ",
+        "roundtrip",
+        "one-way",
+        "non-stop",
+        "flights",
+        "flight",
+        "error fare",
+        "business class",
+    ]
+
+    if not any(keyword in text for keyword in required_keywords):
+        return False, "航空券記事らしいキーワードが不足"
+
+    return True, ""
+
+
+# =========================
+# ルート・価格解析
+# =========================
+
+def clean_route_part(text: str) -> str:
+    text = html.unescape(text)
+    text = normalize_text(text)
+
+    remove_prefixes = [
+        "🔥",
+        "⚠️",
+        "😲",
+        "crazy hot",
+        "error fare",
+        "business class",
+        "summer",
+        "xmas",
+        "new year",
+        "open-jaw",
+        "non-stop",
+        "cheap flights from",
+        "flights from",
+        "flight from",
+        "from",
+    ]
+
+    for prefix in remove_prefixes:
+        text = text.replace(prefix, " ")
+
+    text = re.sub(r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},\s+\d{4}\b", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" -:,.()[]")
+
+    return text
+
+
+def parse_route(article: Article) -> Optional[Dict[str, str]]:
+    text = normalize_text(article.title)
+
+    # 日付を除去
+    text = re.sub(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},\s+\d{4}\b",
+        " ",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+
+    patterns = [
+        # from Tokyo, Japan to Singapore for only ...
+        r"(?:non-stop\s+)?from\s+(.+?)\s+to\s+(.+?)(?:\s+for\s+only|\s+from\s+only|\s+for\s+|\s+from\s+|$)",
+
+        # Tokyo, Japan to Singapore for only ...
+        r"^(.+?)\s+to\s+(.+?)(?:\s+for\s+only|\s+from\s+only|\s+for\s+|\s+from\s+|$)",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if not m:
             continue
 
-        print("確認中:", title)
+        origin = clean_route_part(m.group(1))
+        destination = clean_route_part(m.group(2))
 
-        # Sランク：日本発ヨーロッパ候補のみ通知
-        if not is_japan_to_europe(title):
+        if origin and destination and origin != destination:
+            return {
+                "origin": origin,
+                "destination": destination,
+            }
+
+    return None
+
+
+def extract_price_text(text: str) -> Optional[str]:
+    text = html.unescape(text)
+
+    patterns = [
+        r"(?:only\s+)?([€$£¥]\s?[0-9,]+(?:\s?(?:usd|cad|aud|eur|gbp|jpy))?(?:\s?(?:one-way|roundtrip))?)",
+        r"from\s+only\s+([€$£¥]\s?[0-9,]+(?:\s?(?:usd|cad|aud|eur|gbp|jpy))?(?:\s?(?:one-way|roundtrip))?)",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            return re.sub(r"\s+", " ", m.group(1)).strip()
+
+    return None
+
+
+# =========================
+# 日本発判定・ランク判定
+# =========================
+
+def is_japan_origin(origin_text: str) -> bool:
+    return contains_any(origin_text, JAPAN_ORIGIN_KEYWORDS)
+
+
+def classify_destination_rank(destination_text: str) -> Tuple[str, str]:
+    destination_text = normalize_text(destination_text)
+
+    if contains_any(destination_text, S_RANK_DESTINATION_KEYWORDS):
+        return "S", "日本発の長距離・欧州/北米/中東方面候補"
+
+    if contains_any(destination_text, A_RANK_DESTINATION_KEYWORDS):
+        return "A", "日本発のアジア方面候補"
+
+    return "B", "日本発のその他方面候補"
+
+
+def build_candidate(article: Article) -> Optional[Candidate]:
+    print(f"確認中: {article.title}")
+
+    if not is_recent_article(article.date):
+        date_text = article.date.strftime("%Y-%m-%d") if article.date else "unknown"
+        print(f"除外理由: 古い記事のため除外 date={date_text}")
+        return None
+
+    is_flight, reason = is_probable_flight_article(article)
+    if not is_flight:
+        print(f"除外理由: {reason}")
+        return None
+
+    route = parse_route(article)
+    print(f"route parse: {route}")
+
+    if not route:
+        print("除外理由: ルート解析不可")
+        return None
+
+    origin = route["origin"]
+    destination = route["destination"]
+
+    if not is_japan_origin(origin):
+        print(f"日本発判定: false / origin={origin}")
+        print("除外理由: 出発地が日本ではない")
+        return None
+
+    rank, rank_reason = classify_destination_rank(destination)
+    price_text = extract_price_text(article.title) or extract_price_text(article.text)
+
+    print(f"日本発判定: true / origin={origin}")
+    print(f"通知ランク: {rank} / {rank_reason}")
+    print(f"destination={destination}")
+
+    return Candidate(
+        article=article,
+        origin=origin,
+        destination=destination,
+        price_text=price_text,
+        rank=rank,
+        rank_reason=rank_reason,
+    )
+
+
+# =========================
+# LINE通知
+# =========================
+
+def build_line_message(candidate: Candidate) -> str:
+    rank_emoji = {
+        "S": "🔥",
+        "A": "🇯🇵",
+        "B": "🛫",
+    }.get(candidate.rank, "🛫")
+
+    header = f"{rank_emoji} {candidate.rank}ランク：日本発セール候補"
+
+    price_line = f"価格：{candidate.price_text}" if candidate.price_text else "価格：記事内で確認"
+
+    message = f"""{header}
+
+{candidate.article.title}
+
+{price_line}
+出発地：{candidate.origin}
+目的地：{candidate.destination}
+
+{candidate.article.url}"""
+
+    return message.strip()
+
+
+def send_line_message(message: str) -> bool:
+    if not LINE_CHANNEL_ACCESS_TOKEN:
+        print("LINE_CHANNEL_ACCESS_TOKEN が設定されていません。")
+        return False
+
+    if not LINE_USER_ID:
+        print("LINE_USER_ID が設定されていません。")
+        return False
+
+    url = "https://api.line.me/v2/bot/message/push"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+    }
+
+    payload = {
+        "to": LINE_USER_ID,
+        "messages": [
+            {
+                "type": "text",
+                "text": message,
+            }
+        ],
+    }
+
+    for attempt in range(1, MAX_RETRY_COUNT + 2):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=HTTP_TIMEOUT_SECONDS,
+            )
+
+            print(f"LINE status: {response.status_code}")
+            print(f"LINE response: {response.text}")
+
+            if 200 <= response.status_code < 300:
+                return True
+
+        except Exception as e:
+            print(f"LINE送信失敗 attempt={attempt}: {e}")
+
+        if attempt <= MAX_RETRY_COUNT:
+            time.sleep(RETRY_WAIT_SECONDS)
+
+    return False
+
+
+# =========================
+# メイン処理
+# =========================
+
+def main() -> None:
+    print("=== Secret Flying Monitor Start ===")
+    print(f"実行日時 JST: {now_jst().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    seen_urls = load_seen_urls()
+    print(f"通知済みURL数: {len(seen_urls)}")
+
+    articles = collect_articles()
+    print(f"取得記事数: {len(articles)}")
+
+    candidates: List[Candidate] = []
+    already_seen_count = 0
+
+    for article in articles:
+        if article.url in seen_urls:
+            already_seen_count += 1
+            print(f"通知済みのため除外: {article.url}")
             continue
 
-        matched_count += 1
+        candidate = build_candidate(article)
+        if candidate:
+            candidates.append(candidate)
 
-        message = build_message(article)
+    print(f"通知済み除外数: {already_seen_count}")
+    print(f"条件一致記事数: {len(candidates)}")
+    print(f"通知件数: {len(candidates)}")
 
-        print("通知対象:")
+    if not candidates:
+        print("通知対象なし")
+        print("=== Secret Flying Monitor End ===")
+        return
+
+    newly_sent_urls: List[str] = []
+
+    for candidate in candidates:
+        message = build_line_message(candidate)
+        print("通知文:")
         print(message)
 
-        notify(message)
-        print("✅ LINE通知完了")
+        success = send_line_message(message)
 
-        seen.add(url)
-        notified_count += 1
+        if success:
+            newly_sent_urls.append(candidate.article.url)
+        else:
+            print("LINE送信失敗のため、以降の履歴更新は行いません。")
+            print("=== Secret Flying Monitor End ===")
+            return
 
-    save_seen(seen)
+    updated_seen_urls = sorted(set(seen_urls + newly_sent_urls))
+    save_seen_urls(updated_seen_urls)
 
-    print("条件一致記事数:", matched_count)
-    print("通知件数:", notified_count)
+    print(f"seen_urls.json updated: +{len(newly_sent_urls)}")
     print("=== Secret Flying Monitor End ===")
 
 
