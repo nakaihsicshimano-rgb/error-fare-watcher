@@ -18,11 +18,9 @@ from bs4 import BeautifulSoup
 
 JST = timezone(timedelta(hours=9))
 
+# 日本発ページのみ監視する
 MONITOR_URLS = [
-    "https://www.secretflying.com/",
-    "https://www.secretflying.com/errorfare/",
-    "https://www.secretflying.com/posts/category/error-fare/",
-    "https://www.secretflying.com/east-asia-flight-deals/",
+    "https://www.secretflying.com/cheap-flights-from/japan/",
 ]
 
 SEEN_URLS_FILE = "seen_urls.json"
@@ -31,12 +29,13 @@ HTTP_TIMEOUT_SECONDS = 20
 MAX_RETRY_COUNT = 2
 RETRY_WAIT_SECONDS = 3
 
+# 新着性を重視するため、直近14日以内の記事を対象にする
 MAX_ARTICLE_AGE_DAYS = 14
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
 LINE_USER_ID = os.getenv("LINE_USER_ID", "").strip()
 
-USER_AGENT = "Mozilla/5.0 SecretFlyingMonitor/1.1"
+USER_AGENT = "Mozilla/5.0 SecretFlyingMonitor/1.2"
 
 
 # =========================
@@ -135,6 +134,8 @@ S_RANK_DESTINATION_KEYWORDS = [
     "doha",
     "qatar",
     "middle east",
+    "saudi arabia",
+    "riyadh",
 ]
 
 A_RANK_DESTINATION_KEYWORDS = [
@@ -176,6 +177,11 @@ EXCLUDE_TITLE_KEYWORDS = [
     "credit card",
     "travel guide",
     "complete guide",
+    "skip to content",
+    "how does secret flying work",
+    "frequently asked questions",
+    "travel glossary",
+    "fuel dumping tool",
 ]
 
 
@@ -312,9 +318,22 @@ def is_secretflying_article_url(url: str) -> bool:
         "about",
         "membership",
         "premium",
+        "plans",
+        "alerts",
+        "login",
+        "register",
+        "cheap-flights-from",
+        "hotel",
+        "hotels",
+        "guides",
+        "blog",
     ]
 
     if any(part in path for part in excluded_path_parts):
+        return False
+
+    # Secret Flyingの記事は /posts/... 配下を優先する
+    if "/posts/" not in parsed.path.lower():
         return False
 
     return True
@@ -497,7 +516,11 @@ def clean_route_part(text: str) -> str:
     for prefix in remove_prefixes:
         text = text.replace(prefix, " ")
 
-    text = re.sub(r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},\s+\d{4}\b", " ", text)
+    text = re.sub(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},\s+\d{4}\b",
+        " ",
+        text,
+    )
     text = re.sub(r"\s+", " ", text)
     text = text.strip(" -:,.()[]")
 
